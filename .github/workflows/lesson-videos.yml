@@ -1,0 +1,187 @@
+# THE LESSON VIDEOS, MADE IN THE PUBLIC DOWNLOAD REPOSITORY (Programmer 4, 23 Nov — the build minutes of the private
+# repository are used up; a public repository builds for free, like the installers: build-installers.yml).
+# Put this file in kleinmanshloma/perfect-invoicing-download as .github/workflows/lesson-videos.yml (a copy of
+# scripts/lesson-video/public-repo/lesson-videos.yml in the private repository). It uses the same secret as the
+# installers, SHOP_READ_TOKEN (read only): the program's code is read from the private repository at each run and is
+# never kept here. The videos go to this repository's own release "lesson-videos" (with this repository's own token).
+# Below: the same steps as the private repository's .github/workflows/lesson-videos.yml.
+# THE LESSON VIDEOS (Programmer 4, T5) — every lesson as a real video, made FROM the lesson files by
+# scripts/lesson-video (the real program in the lesson company, the look of scripts/lesson-video/look.mjs, the voice
+# files that exist). The videos are NOT in this repository and NOT on the server's disk: they are files of ONE release,
+# "lesson-videos", of the public download repository (variable DOWNLOADS_REPO, secret DOWNLOADS_TOKEN — the same two as
+# the installers), with a small list (lesson-videos.json: lesson, language, file, length, the start of every step) the
+# program reads. Only a lesson whose hash changed is made again; a video that fails its checks is never put there (the
+# lesson on the screens stays its backup). One contact sheet per video is kept with the run (Artifacts), not in git.
+# It runs ONLY BY HAND (Actions → Lesson videos → Run workflow) — the owner, 22 Nov: the build minutes of this
+# repository are used up. A changed lesson keeps its old video until this is run; the lesson on the screens is right.
+name: Lesson videos
+
+on:
+  workflow_dispatch:
+    inputs:
+      lessons:
+        description: 'Lesson keys, with commas (empty = every lesson)'
+        type: string
+        default: ''
+      langs:
+        description: 'Languages, with commas'
+        type: string
+        default: 'en,nl,fr'
+      force:
+        description: 'Make them again, also when nothing changed'
+        type: boolean
+        default: false
+
+# one run at a time; pushes that come meanwhile wait as ONE next run
+concurrency:
+  group: lesson-videos
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  RELEASE: lesson-videos
+  DOWNLOADS_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+  WANT: ${{ inputs.lessons && format('--lesson {0}', inputs.lessons) || '--all' }}
+  FORCE: ${{ inputs.force && '--force' || '' }}
+
+jobs:
+  plan:
+    name: What must be made
+    runs-on: ubuntu-latest
+    outputs:
+      langs: ${{ steps.plan.outputs.langs }}
+      todo: ${{ steps.plan.outputs.todo }}
+    steps:
+      - name: The program's code from the private repository (read only; never kept here)
+        uses: actions/checkout@v4
+        with:
+          repository: kleinmanshloma/shop
+          ref: main
+          token: ${{ secrets.SHOP_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The release and its list
+        run: |
+          if [ -z "$DOWNLOADS_REPO" ] || [ -z "$GH_TOKEN" ]; then echo "::error::this repository's own token is needed"; exit 1; fi
+          # (--latest=false: the installers' release stays the "latest" one — their download links point there)
+          gh release view "$RELEASE" -R "$DOWNLOADS_REPO" >/dev/null 2>&1 || gh release create "$RELEASE" -R "$DOWNLOADS_REPO" --latest=false --title "Lesson videos" --notes "The lesson videos of Perfect Invoicing (made by the program's build machines from the lessons). The program plays them in its lesson window."
+          mkdir -p have && gh release download "$RELEASE" -R "$DOWNLOADS_REPO" -p lesson-videos.json -D have --clobber || echo '{"videos":{}}' > have/lesson-videos.json
+      - id: plan
+        run: |
+          LANGS="${{ inputs.langs || 'en,nl,fr' }}"
+          PLAN=$(node scripts/lesson-video/make.mjs $WANT --lang "$LANGS" $FORCE --have have/lesson-videos.json --plan | grep '^PLAN ' | cut -c6-)
+          echo "$PLAN"
+          echo "todo=$(node -p "JSON.parse(process.argv[1]).todo" "$PLAN")" >> "$GITHUB_OUTPUT"
+          echo "langs=$(node -p "JSON.stringify(JSON.parse(process.argv[1]).langs)" "$PLAN")" >> "$GITHUB_OUTPUT"
+
+  make:
+    name: Make the videos (${{ matrix.lang }})
+    needs: plan
+    if: needs.plan.outputs.todo != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: ${{ fromJson(needs.plan.outputs.langs) }}
+    steps:
+      - name: The program's code from the private repository (read only; never kept here)
+        uses: actions/checkout@v4
+        with:
+          repository: kleinmanshloma/shop
+          ref: main
+          token: ${{ secrets.SHOP_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/invoicing/package-lock.json
+            server/package-lock.json
+            tests/package-lock.json
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: npm ci --no-audit --no-fund --prefix apps/invoicing && npm ci --no-audit --no-fund --prefix server && npm ci --no-audit --no-fund --prefix tests
+      - name: Make them, chapter by chapter (each chapter is put in the release when it is done)
+        env:
+          SHOP_TEST_HEADLESS: '1'
+          LESSON_VIDEO_KEEP_BUILD: '1'
+        run: |
+          export SHOP_TEST_BROWSER_PATH="$(which google-chrome || which chromium-browser || which chromium)"
+          mkdir -p out have
+          put() {
+            # the new videos first, then the list (read again just before: another language may have added to it)
+            ls out/*.mp4 >/dev/null 2>&1 || return 0
+            for i in 1 2 3; do gh release upload "$RELEASE" out/*.mp4 -R "$DOWNLOADS_REPO" --clobber && break || sleep 20; done
+            gh release download "$RELEASE" -R "$DOWNLOADS_REPO" -p lesson-videos.json -D have --clobber || echo '{"videos":{}}' > have/lesson-videos.json
+            node scripts/lesson-video/list.mjs merge have/lesson-videos.json out/lesson-videos.json
+            cp have/lesson-videos.json lesson-videos.json
+            for i in 1 2 3; do gh release upload "$RELEASE" lesson-videos.json -R "$DOWNLOADS_REPO" --clobber && break || sleep 20; done
+            mkdir -p done && mv out/*.mp4 done/ && rm -f done/*.mp4
+          }
+          gh release download "$RELEASE" -R "$DOWNLOADS_REPO" -p lesson-videos.json -D have --clobber || echo '{"videos":{}}' > have/lesson-videos.json
+          cp have/lesson-videos.json out/lesson-videos.json
+          if [ -n "${{ inputs.lessons }}" ]; then
+            node scripts/lesson-video/make.mjs $WANT --lang ${{ matrix.lang }} $FORCE --out out --soft
+            put
+          else
+            for chapter in till start sell buy contacts stock money settings admin; do
+              echo "::group::Chapter $chapter (${{ matrix.lang }})"
+              node scripts/lesson-video/make.mjs --chapter "$chapter" --lang ${{ matrix.lang }} $FORCE --out out --soft || echo "::warning::chapter $chapter (${{ matrix.lang }}) stopped"
+              cp out/report.json "out/report-$chapter.json" 2>/dev/null || true
+              put
+              echo "::endgroup::"
+            done
+          fi
+          node scripts/lesson-video/list.mjs summary out/lesson-videos.json
+          cat out/report*.json | grep -c '"problems"' | xargs -I{} echo "Videos that failed their checks (their lesson plays on the screens): {}"
+          grep -h -B2 -A6 '"problems"' out/report*.json | head -200 || true
+      - name: The contact sheets of this run (one picture per video)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contact-sheets-${{ matrix.lang }}
+          path: |
+            out/sheets
+            out/report*.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  finish:
+    name: The list, old files away, and "does it play?"
+    needs: [plan, make]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: The program's code from the private repository (read only; never kept here)
+        uses: actions/checkout@v4
+        with:
+          repository: kleinmanshloma/shop
+          ref: main
+          token: ${{ secrets.SHOP_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The list as it is now; files no list line uses any more are removed
+        run: |
+          mkdir -p have && gh release download "$RELEASE" -R "$DOWNLOADS_REPO" -p lesson-videos.json -D have --clobber || echo '{"videos":{}}' > have/lesson-videos.json
+          node scripts/lesson-video/list.mjs summary have/lesson-videos.json | tee -a "$GITHUB_STEP_SUMMARY"
+          node scripts/lesson-video/list.mjs files have/lesson-videos.json | sort > used.txt
+          gh release view "$RELEASE" -R "$DOWNLOADS_REPO" --json assets -q '.assets[].name' | grep '\.mp4$' | sort > there.txt || true
+          comm -13 used.txt there.txt | while read -r old; do echo "old: $old"; gh release delete-asset "$RELEASE" "$old" -R "$DOWNLOADS_REPO" -y || true; done
+          comm -23 used.txt there.txt | sed 's/^/::warning::in the list but not in the release: /'
+      - name: Does a video play from where it lives? (Chromium, Firefox, Safari's engine, a phone size)
+        run: |
+          FILE=$(head -1 used.txt)
+          if [ -z "$FILE" ]; then echo "No video yet."; exit 0; fi
+          URL="https://github.com/$DOWNLOADS_REPO/releases/download/$RELEASE/$FILE"
+          echo "The address: $URL"
+          curl -sIL "$URL" | grep -i -E '^(HTTP|content-type|content-length|accept-ranges|content-disposition|location: https://[^/]*)' | cut -c1-160 || true
+          mkdir -p /tmp/playcheck && cp scripts/lesson-video/playcheck.mjs /tmp/playcheck/ && cd /tmp/playcheck && npm init -y >/dev/null && npm i --no-audit --no-fund playwright >/dev/null && npx playwright install --with-deps chromium firefox webkit >/dev/null
+          node playcheck.mjs "$URL" | tee -a "$GITHUB_STEP_SUMMARY"
