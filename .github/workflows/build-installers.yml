@@ -1,0 +1,247 @@
+# BUILDS THE INSTALLERS of Perfect Invoicing (Windows and Mac) and puts them in a release of THIS repository.
+# It runs here because GitHub's build machines are free for a public repository.
+# The program's code is NOT in this repository and is never put here: each run reads the installed program's part
+# (two folders) from the private repository with the secret SHOP_READ_TOKEN (a token that may only READ that
+# repository), builds, and keeps nothing but the installer files and the update files — as before.
+# Start it by hand: Actions → "Build the installers" → Run workflow.
+name: Build the installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Also put the installers in a release (desktop-v<version>)'
+        type: boolean
+        default: true
+      ref:
+        description: 'Which version of the program to build (a branch or a tag)'
+        type: string
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: kleinmanshloma/shop
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows installer, os: windows-latest }
+          - { name: Mac installer, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/desktop
+    steps:
+      - name: The installed program's part of the private repository (read only; never kept here)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.SHOP_READ_TOKEN }}
+          sparse-checkout: |
+            apps/desktop
+            shared
+            bridge
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: The shell's automatic tests
+        run: npm test
+
+      # the owner's certificates, only when they are in this repository's secrets (else: unsigned, which works)
+      - name: Signing (only with the owner's certificates)
+        env:
+          MAC_CERTIFICATE: ${{ secrets.MAC_CERTIFICATE }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_PUBLISHER_NAME: ${{ secrets.AZURE_PUBLISHER_NAME }}
+        run: |
+          keep() { if [ -n "$2" ]; then echo "$1=$2" >> "$GITHUB_ENV"; fi; }
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$MAC_CERTIFICATE" ]; then
+            keep CSC_LINK "$MAC_CERTIFICATE"; keep CSC_KEY_PASSWORD "$MAC_CERTIFICATE_PASSWORD"
+            keep APPLE_ID "$APPLE_ID"; keep APPLE_APP_SPECIFIC_PASSWORD "$APPLE_APP_SPECIFIC_PASSWORD"; keep APPLE_TEAM_ID "$APPLE_TEAM_ID"
+            echo "Mac: signed with the owner's certificate."
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            echo "Mac: UNSIGNED (no certificate in the secrets yet)."
+          fi
+          if [ "$RUNNER_OS" = "Windows" ] && [ -n "$AZURE_CLIENT_SECRET" ]; then
+            keep AZURE_TENANT_ID "$AZURE_TENANT_ID"; keep AZURE_CLIENT_ID "$AZURE_CLIENT_ID"; keep AZURE_CLIENT_SECRET "$AZURE_CLIENT_SECRET"
+            keep AZURE_SIGNING_ACCOUNT "$AZURE_SIGNING_ACCOUNT"; keep AZURE_SIGNING_PROFILE "$AZURE_SIGNING_PROFILE"
+            keep AZURE_SIGNING_ENDPOINT "$AZURE_SIGNING_ENDPOINT"; keep AZURE_PUBLISHER_NAME "$AZURE_PUBLISHER_NAME"
+            echo "Windows: signed with Azure Trusted Signing."
+          elif [ "$RUNNER_OS" = "Windows" ] && [ -n "$WINDOWS_CERTIFICATE" ]; then
+            keep WIN_CSC_LINK "$WINDOWS_CERTIFICATE"; keep WIN_CSC_KEY_PASSWORD "$WINDOWS_CERTIFICATE_PASSWORD"
+            echo "Windows: signed with the owner's certificate file."
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "Windows: UNSIGNED (no certificate in the secrets yet)."
+          fi
+
+      - name: Build the installer
+        run: npx electron-builder --config electron-builder.config.cjs --publish never
+
+      - name: 'Windows: install, start check, uninstall leaves nothing'
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = "dist\Perfect-Invoicing-Setup.exe"
+          Start-Process -FilePath $setup -ArgumentList '/S' -Wait
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs'
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter 'Perfect Invoicing.exe' | Select-Object -First 1
+          if (-not $exe) { throw "The installed program was not found under $dir" }
+          node scripts/smoke.mjs "$($exe.FullName)"
+          if ($LASTEXITCODE -ne 0) { throw "The start check failed" }
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA 'Perfect Invoicing') | Out-Null
+          Set-Content -Path (Join-Path $env:APPDATA 'Perfect Invoicing\settings.json') -Value '{}'
+          $un = Get-ChildItem -Path $exe.DirectoryName -Filter 'Uninstall*.exe' | Select-Object -First 1
+          Start-Process -FilePath $un.FullName -ArgumentList '/S' -Wait
+          Start-Sleep -Seconds 8
+          if (Test-Path $exe.FullName) { throw "The uninstaller left the program behind" }
+          if (Test-Path (Join-Path $env:APPDATA 'Perfect Invoicing')) { throw "The uninstaller left the program's data behind" }
+          Write-Host "Installed, started and uninstalled: nothing left behind."
+      - name: 'Mac: start check from the .dmg'
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil attach dist/Perfect-Invoicing.dmg -nobrowse -mountpoint /tmp/pi-dmg
+          cp -R "/tmp/pi-dmg/Perfect Invoicing.app" /tmp/
+          hdiutil detach /tmp/pi-dmg
+          lipo -archs "/tmp/Perfect Invoicing.app/Contents/MacOS/Perfect Invoicing"
+          codesign --verify --deep "/tmp/Perfect Invoicing.app" && echo "The signature is in order."
+          node scripts/smoke.mjs "/tmp/Perfect Invoicing.app/Contents/MacOS/Perfect Invoicing"
+      - name: 'Mac: the same program as an Intel Mac runs it'
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          cat > /tmp/intel.sh <<'SH'
+          #!/bin/bash
+          exec arch -x86_64 "/tmp/Perfect Invoicing.app/Contents/MacOS/Perfect Invoicing" "$@"
+          SH
+          chmod +x /tmp/intel.sh
+          node scripts/smoke.mjs /tmp/intel.sh
+      - name: Keep the installers with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ runner.os }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            apps/desktop/dist/Perfect-Invoicing-Setup.exe
+            apps/desktop/dist/Perfect-Invoicing-Setup.exe.blockmap
+            apps/desktop/dist/Perfect-Invoicing.dmg
+            apps/desktop/dist/Perfect-Invoicing.dmg.blockmap
+            apps/desktop/dist/Perfect-Invoicing.zip
+            apps/desktop/dist/Perfect-Invoicing.zip.blockmap
+            apps/desktop/dist/latest*.yml
+
+  # the real printing of Windows and macOS (a printer that prints into nothing): a page through a real printer driver,
+  # raw bytes and the drawer's pulse through the system's raw line, with the times. It never stops the installers.
+  printing:
+    name: Real printing check (${{ matrix.name }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest }
+          - { name: Mac, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.SHOP_READ_TOKEN }}
+          sparse-checkout: |
+            apps/desktop
+            shared
+            bridge
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - name: 'Windows: a printer that prints into a file'
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'pi-check.prn'
+          Add-PrinterPort -Name $out
+          Add-PrinterDriver -Name 'Generic / Text Only'
+          Add-Printer -Name 'PI Check' -DriverName 'Generic / Text Only' -PortName $out
+          $env:PI_REAL_PRINTER = 'PI Check'
+          node --test --test-reporter=spec test/real-printer.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "The real printing check failed" }
+          Start-Sleep -Seconds 3
+          if (Test-Path $out) { Write-Host "What reached the printer's line: $((Get-Item $out).Length) bytes" } else { Write-Host "::warning::Nothing reached the printer's line" }
+      - name: 'Mac: a printer that prints into nothing'
+        if: runner.os == 'macOS'
+        run: |
+          sudo sh -c 'echo "FileDevice Yes" >> /etc/cups/cups-files.conf'
+          sudo launchctl stop org.cups.cupsd || true
+          sudo launchctl start org.cups.cupsd || true
+          sleep 3
+          PPD="/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd"
+          sudo lpadmin -p PI_Check -E -v file:/dev/null -P "$PPD"
+          lpstat -p || true
+          PI_REAL_PRINTER=PI_Check node --test --test-reporter=spec test/real-printer.test.mjs
+
+  release:
+    name: Put the installers in a release
+    needs: build
+    if: inputs.release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Release (the installer files and the update files, nothing else)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          TAG="desktop-v$VERSION"
+          ls -la files
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" files/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --latest -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" files/* -R "$GITHUB_REPOSITORY" --latest --title "Perfect Invoicing for Windows and Mac $VERSION" --notes "Windows: Perfect-Invoicing-Setup.exe · Mac (Apple chip and Intel): Perfect-Invoicing.dmg. The program updates itself from these files."
+          fi
+      - name: The public links answer without a sign-in
+        run: |
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+          for f in Perfect-Invoicing-Setup.exe Perfect-Invoicing.dmg latest.yml latest-mac.yml; do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' "$BASE/$f")
+            echo "$f: $code"
+            [ "$code" = "200" ] || { echo "::error::$BASE/$f does not answer with the file"; exit 1; }
+          done
